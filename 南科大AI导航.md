@@ -108,8 +108,7 @@ HTML5是一种标准的网页制作语言，它是HTML（超文本标记语言�
 #### 简单示例
 
 以下是一个简单的gps定位获取实现
-
-![image-20231027004517260](C:\Users\GZ632\AppData\Roaming\Typora\typora-user-images\image-20231027004517260.png)
+![image-20231027004517260](https://github.com/MikAilis/CXSJ-III-Sustech-LLM-navigation/assets/100832845/0a537338-c855-43e3-90f2-820d89ce809d)
 
 
 
