@@ -60,7 +60,8 @@ Unity WebGL是Unity引擎的一个输出平台，它可以将Unity项目导出�
 
 https://u3dc.com/3d/examples/hdr.html这是一个unity WebGL的例子
 
-![image-20231027005144678](C:\Users\GZ632\AppData\Roaming\Typora\typora-user-images\image-20231027005144678.png)
+
+![image-20231027005144678](https://github.com/MikAilis/CXSJ-III-Sustech-LLM-navigation/assets/100832845/688bf2ff-e75e-4390-aad2-709cee35886b)
 
 #### 优缺点分析
 
@@ -83,7 +84,7 @@ https://u3dc.com/3d/examples/hdr.html这是一个unity WebGL的例子
 
 Unity WebGL 虽然在大部分浏览器上都支持，但是支持程度以及性能表现不一样，在一些高端设备上可以运行，但是有些设备是没有那么大内存来支持 Unity WebGL 的。
 
-<img src="C:\Users\GZ632\AppData\Roaming\Typora\typora-user-images\image-20231027005540453.png" alt="image-20231027005540453" style="zoom:50%;" />
+![image-20231027005540453](https://github.com/MikAilis/CXSJ-III-Sustech-LLM-navigation/assets/100832845/412efe6c-5500-4b41-b2c9-d516c585b665)
 
 ### HTML5
 
