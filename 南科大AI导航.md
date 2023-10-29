@@ -86,7 +86,7 @@ https://u3dc.com/3d/examples/hdr.html这是一个unity WebGL的例子
 
 Unity WebGL 虽然在大部分浏览器上都支持，但是支持程度以及性能表现不一样，在一些高端设备上可以运行，但是有些设备是没有那么大内存来支持 Unity WebGL 的。
 
-![image-20231027005540453](https://github.com/MikAilis/CXSJ-III-Sustech-LLM-navigation/assets/100832845/412efe6c-5500-4b41-b2c9-d516c585b665)
+![image-20231027005524730](https://github.com/MikAilis/CXSJ-III-Sustech-LLM-navigation/assets/100832845/5c5f3f57-5b97-4197-a5cc-8bd13e9af9c5)
 
 ### HTML5
 
