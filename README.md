@@ -1,0 +1,559 @@
+# 第二次创新实践答辩
+
+
+
+
+
+## 为什么选择LoRA（QLoRA) 
+
+以往最常见的微调方式是fine-tuning，即全参数微调。全参数微调的性能潜力往往更高（因为它可以调整所有的参数），定制化能力也更强，并且实现起来相对简单。但是其最大的问题是它会耗费大量的计算资源和时间（前者往往更致命）。即便在尽可能压缩的情况下，微调一个65B模型也需要耗费两百多GB的显存$^0$。这无疑是不可能接受的（即便是使用80GB显存的A100，也需要至少三块）$^0$。
+
+随着科技的进步，人们逐渐探索出了其他的微调方法。例如固定住原来预训练模型的参数不变，只对新增的 Adapter 结构进行微调的**Adapter Tuning**$^1$；利用人工构建的离散模板（patterns）和提示（prompts）来指导模型更好地理解和处理特定的任务的**Pattern-Exploiting Training**；在模型输入前添加一个连续的且任务特定的向量序列（prefix），在下游微调时，LM的参数被冻结，只有prefix部分的参数进行更新的**Prefix Tuning$^2$**；还有放弃了使用自然语言构成的模板，将模板转化为一组连续的可学习参数，并使用一种自适应的剪枝策略，对大型语言模型中的参数进行裁剪，去除其中不必要的冗余参数的**P-Tuning$^3$**。图一展示了，在P-Tuning的prefix部分，每一层transformer的embedding输入都需要被tuned。
+
+
+
+![image-20231127134520107](C:\Users\creegon\AppData\Roaming\Typora\typora-user-images\image-20231127134520107.png)
+
+<center>图一</center>
+
+
+
+尽管这些方法在内存空间和微调性能上逐步达到了一个合理的平衡，但它们依然存在着诸多不足，比如往往需要引入可训练的prompt token来改进性能，这会导致模型参数数量的增加和可能的增加训练的复杂性和时间。或者关于prompt的设计或多或少还是会依赖于特定的项目，这也会降低泛化性。如此便引出了我们采用的微调方法：**LoRA$^4$**，其全称是**LOW-RANK ADAPTATION OF LARGE LANGUAGE MODELS**。
+
+LoRA的核心思想是，用一种低秩的方式来调整这些参数矩阵（它冻结了预训练的模型权重，并将可训练的秩分解矩阵注入到 Transformer 架构的每一层中，大大减少了下游任务的可训练参数的数量）（大致过程可参照图二）
+
+<img src="C:\Users\creegon\AppData\Roaming\Typora\typora-user-images\image-20231124145758451.png" width="600" height="500" alt="ddd">
+
+
+
+<center>图二</center>
+
+详细的过程可拆解为如下四步：
+
+1. 对于模型中的每个权重矩阵$W$，而不是直接对$W$进行修改，我们维持$W$不变。
+
+2. 我们引入两个新的矩阵$U$(通常称为更新矩阵)和$V$(通常称为投影矩阵)，并训练这两个矩阵来学习权重的修改。
+
+3. 在模型的前向传播中，原始的权重矩阵$W$被替换为$W＋△W$，其中$△W =UxV$。这个$△W$代表对$W$的修改，而由于$U$和$V$的维度，$△W$是一个低秩矩阵。
+
+4. 这样，即使$△W$是低秩的，它也可以捕捉到$W$的重要变化。并且，由于$U$和$V$的参数数量远少于W的参数数量，所以这种方法能够减少需要训练的参数总数。
+
+
+
+对于前面的**显存占用过大**以及**训练时间过长这两个问题**，LoRA都有良好的解决效益。另外，LoRA还可以带来一些额外的惊喜：
+
+* 虽然LoRA在模型中引入了新参数和计算，稍微减慢了前向传播的速度。但另一方面，GPU之间需要进行的梯度通信较少，加快了反向传播速度。并且得益于秩分解，这两个低秩权重矩阵的参数量相比于原先的权重矩阵根本不在同一个量级上，故而时间可以大幅度缩短。
+* 显存占用方面，也因为改写的参数量从 $d×d$ 降低至 $2×r×d$（即在一个epoch的训练完成后，只需保存这些低秩矩阵的部分），所以相对于全参数，LoRA的显存占用率也有了质的突破（权威测量如图三所示）。同时经过我们的测试，对于一个**7b**的模型（internlm-7b），在**float16**精度下，微调占用的显存也仅有**17GB**左右。（相较于全参数微调的**50GB**，的确显著减少了）
+* 与常规checkpoint相比，LoRA的checkpoint明显更小（对于一个7b的模型，每个checkpoint大约只有**0.89GB**的大小，明显小于全参数的checkpoint）。这更便于扩展服务，特别是在管理多个经微调的模型时。并且如果我们想测试一轮训练中不同epoch的情况时（比如对寻找最佳loss的时候），这样大小和规模的checkpoint将能更加降低存储空间损耗，以及模型合并耗费的时间。
+
+<img src="https://pic1.zhimg.com/80/v2-84ac30537d4547249cf5080a3eff2d23_1440w.webp?source=1def8aca" width="700" height="500" alt="ddd">
+
+<center>图三</center>
+
+而**QLoRA**$^5$，这种能够实现高保真的4位微调的微调方法，则在此基础上，添加了：
+
+* **4-bit NormalFloat Quantization（减小数据范围，但是尽量保持数据原有的信息。将连续的值映射到一个有限的离散集合中）**
+* **Double Quantization（减少神经网络参数所需存储空间的技术，通过量化参数以减少每个参数需要的位数，进而减少模型的存储大小和加速计算）**
+* **Paged Optimizers（利用了NVIDIA GPU的统一内存特性。允许在GPU内存不足时，自动将数据传输到CPU内存，并在需要时重新传回GPU）**
+
+使得显存占用率进一步降低。
+
+故而，权衡利弊后，在微调上，我们采用了LoRA及其变体的微调手段。
+
+
+
+## 实际实验
+
+ 首先介绍下我们的部分参数选择：
+
+> $r = 32$  (秩数，它影响模型参数量和其能够控制内容的粒度。因为我们数据集（100K）较小，同时显存空间有限，故而选择32这个中间值)
+>
+> $alpha = 64$ (缩放因子，通过这个值与LoRA Rank的比例，可以调整LoRA层的强度。我们希望LoRA层的影响力更强，所以选择了两倍)
+>
+> $dropout = 0.1$ (神经元随机丢弃的概率，用于防止模型过拟合。这是默认推荐值。我们也尝试了其他值，但效果不尽人意，最终选择原封不动)
+>
+> $maxLength = 2048$ (最大拼接长度。在实际微调中，模型会根据这个值，根据贪婪算法将数据集拼接起来。结合显卡实际现状，选择了2048)
+>
+> $lr = 1e-3$ (学习率，通常来说$1e-5$ 到 $1e-2$ 之间的值是一个不错的选择。经过反复测试，我们发现$1e-3$的表现相对较好)
+>
+> Optimizer：adamw_torch (adam优化器一直以来被广泛使用，而torch变种更能结合权重衰减的优点，有助于更有效的训练过程和减少过拟合)
+>
+> max_new_tokens = 256 
+>
+> temperture = 0.7 
+>
+> top_p = 0.95 
+
+
+
+
+
+我们本周期的测试目标主要集中于数据集上（具体的微调方法的改进需要长时间的经验积累）。
+
+数据集统一采用**alpaca**格式，同时因为南科大ai向导的任务需求（即通常来说只需要一问一答），而都采用了**单轮问答**的格式。格式的示例如下：
+
+```json
+"conversation":[
+
+    {
+
+      "system": "(指定的大模型身份，让大模型更能了解此时的任务需求)",
+
+      "input": "(用户可能的提问)",
+
+      "output": "(要求的大模型的回答)"
+
+    }
+
+  ]
+```
+
+数据集的定义如下：
+
+* **original_data**：这是从南方科技大学官网计算机系上爬取的对教师的介绍的数据集，总大小约**50KB**。对每个教师分为两个部分，一为介绍教师（包括其基本信息，履历和成就等）（后面简称为**任务一**），二为询问哪里可以找到教师（会返回教师的邮箱）（后面简称为**任务二**）。我们想借由此来观察大模型的**机械信息泛化能力**和**指定信息检索回答能力**。
+* **duplicate_data**：这是将**original_data**复制粘贴四次后的数据集。我们想借由此来观察，多次重复的数据集会对大模型的**loss**和**拟合能力**产生什么样的影响。
+* **mixed_data**：这是在**original_data**的基础上，添加了从**Niuwa Curriculum Evaluation System**爬取的学生对教师课程的评价的信息的数据集，总大小约**100KB**。另外，我们还把单调的教师信息问答模式进行了调整，使得其在保持原有信息含义的情况下，样式更加多元化。在我们的设想中，南科大ai向导不应该只会给出冷冰冰的机械性回答，而应该能像朋友一般给出人性化，口语化的回答，所以加入了这样较为随意和富含网络用语的数据集。在构建数据集的过程中，我们注意到部分评价有失得体，过于极端，可能会对教师风评产生不应该的不当影响，故而进行了有选择性的数据清洗。
+* **updated_data**: 这是纯粹的由**Niuwa Curriculum Evaluation System**中的学生评价构成的数据集，大小约**120KB**。我们想借由此来观察大模型的**信息综合提取和总结能力**。
+
+
+
+对数据集的验证如下：
+
+* **基本问题**：我们选择了十个直接从微调数据集中复制过来的问题进行测试（五个询问教师信息，五个询问哪里可以找到教师），并且按点给分。
+* **过拟合测试**：为了避免过拟合带来的上面基本问题的高正确率，我们添加了四个钓鱼问题，其格式和基本问题基本类似，但是和教师完全不沾边（比如，在基本问题中的”我在哪里可以找到xxx老师，在钓鱼问题中被替换为了“我在哪里可以找到唐纳德特朗普”和“我在哪里可以找到三体人”）（后面简称为**任务三**）
+
+
+
+我们分为了如下几个测试模块：
+
+### 1. 重复性测试
+
+本次测试对比了**original_data**和**duplicate_data**，选择的base model为internlm-20b。对于**duplicate_data**，因为其在第20个epoch的loss便基本接近0了，故而只训练了20个epoch（剩余的数据由第20个epoch的复制填充）。而**original_data**则是进行了50个epoch的训练。loss和grad_norm（梯度范数）的对比图可参考图四和图五。
+
+<img src="C:\Users\creegon\Desktop\llm\charts\duplicate\loss_duplicate.jpg" width="800" height="500" alt="ddd">
+
+<center>图四</center>
+
+<img src="C:\Users\creegon\Desktop\llm\charts\duplicate\norm_duplicate.jpg" width="800" height="500" alt="ddd">
+
+<center>图五</center>
+
+结合两份图表，可以发现对于**duplicate_data**，它在第6到15个epoch间loss迅速下降，并且参数变化率极大，这表明模型从重复数据中学习了非常多并迅速改进其预测。但作为代价，我们推测，在第15个epoch以后的模型里，它的**过拟合现象应当相当严重**。而对于**original_data**，它的训练曲线相对缓和，没有某一阶段的grad_norm的急剧变化，loss也是平稳的下降。我们推测它的学习能力应该较好。
+
+实际测试结果也印证了我们的推测。在**duplicate_data**的第10个epoch的lora的merge后的模型推断中，它对于任务二的回答的正确率为**100%**，对于任务一的回答符合指定的格式，正确率也有**40%**左右（存在混杂问题）。但是在任务三中，它对于”我可以怎么找到三体人“的回答是：“对不起，我没有他们的地址。但是，你可以通过电子邮件来联系他们：trisolaris@sustech.edu.cn。”这显然就是过拟合造成的结果。此外，我们还观察到，后续的epoch中，即便**它的过拟合现象越来越严重**，但是**它对于任务一的回答准确率却基本没有提升**。
+
+在**original_data**中，即便到了第50个epoch，它也**不存在任何过拟合问题**。并且，**它的回答格式相对更加灵活，不是只拘泥于我提供的样化范式**。例如，我指定的：”对不起，我没有他的地址。但是，你可以通过电子邮件来联系他：xxx。“大模型在实际回答中替换为了：“您可以通过南方科技大学的官方网站来查找xxx教授的联系方式。在南方科技大学的计算机科学与工程系页面上，您可以找到xxx教授的简介和联系方式，包括他的办公室地址、电子邮件地址和电话号码。此外，您还可以通过电子邮件地址xxx来直接联系他。希望这些信息能够帮助您找到xxx教授。”
+
+但是，在**original_data**中，即便loss已经降到接近于0，它回答的正确率依然很低。对于任务二，仅有**60%**（表现为，**它知道邮箱后缀和以名字首字母开头的命名方式，但前面的数字会忘记**）。对于任务一，则仅有**10%**左右（将多个教师的介绍**混杂到了一起**）。
+
+
+
+### 2. 丰富性测试
+
+本次测试对比了**original_data**和**mixed_data**，选择的base model为internlm-7b。每个数据集均训练了100个epoch。loss和grad_norm的对比图可参考图六和图七。（其中**mixed_data**后缀为more）
+
+<img src="C:\Users\creegon\Desktop\llm\charts\data\loss_data.jpg" width="800" height="500" alt="ddd">
+
+<center>图六</center>
+
+<img src="C:\Users\creegon\Desktop\llm\charts\data\norm_data.jpg" width="800" height="500" alt="ddd">
+
+<center>图七</center>
+
+结合两张图表来看，**mixed_data**的loss和gran_norm变化似乎都比较正常，都在相对平衡地变化。并且由于它的loss曲线下降更为平滑和迅速，我们推测在结合了多元化的数据后，它的学习能力更强。
+
+但是实际结果证明了我们的猜想的错误。对于**mixed_data**的第15个epoch，即便它的loss仍然很高，而且实际验证时总体正确率只有**5%**左右（对于所有询问教师信息的问题，它全都回答了不知道），它也依然出现了过拟合的情况。表现为，对于“ 我可以怎么找到唐纳德川普”的问题，它的回答是：“对不起，我没有他的地址。但是，你可以通过电子邮件来与他联系：dcunh@sustech.edu.cn。这是他的邮箱地址，你可以在南方科技大学的网站上找到它。”
+
+在**mixed_data**后续的epoch中，对于任务二的表现反而相对良好，正确率达到了**100%**，但是任务一甚至不如**original_data**在同等epoch下的表现。并且，前面为了提升人性化和口语化所做的举措似乎**完全没有任何效果**。在第15到第50个epoch所merge的模型中，**在同一轮回答中，它所有的回答模板都是固定统一的，并且十分生硬**。我们猜测原因可能如下【PS：下面是复制gpt的，但我觉得不是其中任何一点原因，等待后续讨论】：
+
+* **数据不平衡和数据集大小**：**original_data**数据集相对较小（50KB），而**mixed_data**则是其两倍大小。如果在**mixed_data**中，某一类数据（如教师评价）比其他类别（如教师基本信息）更多，这可能导致模型在训练时对这一类数据过度拟合，而忽视了其他类型的数据。数据不平衡可能导致模型无法有效学习多样化的回答风格。
+* **数据复杂度和多样性**：**mixed_data**不仅包括基本信息，还包括更多样化和随意的内容，如学生评价和网络用语。这种复杂性和多样性的增加可能使模型难以在有限的训练周期内有效学习和泛化。
+* **数据清洗的影响**：对于**mixed_data**，你们进行了选择性的数据清洗，特别是删除了一些极端的评价。这种清洗可能影响了数据的代表性和多样性，进而影响模型的学习能力。
+* **过拟合和泛化能力**：模型在某些特定任务（如任务二）上表现良好，但在其他任务上（如任务一）表现不佳，可能是因为模型对特定类型的数据过拟合，丧失了泛化能力。这表明模型可能过分专注于数据集中的某些特定模式，而忽视了其他重要信息。
+* **训练周期和模型容量**：使用internlm-7b模型，可能在100个epoch内无法充分学习**mixed_data**的复杂性。模型的容量可能不足以处理更复杂、更多样化的数据集。
+* **口语化和人性化策略**：尽管你们试图通过更多元化的样式来提升回答的人性化和口语化，但这可能并不足以改变模型学习的基础结构和方式。口语化和人性化可能需要更细致的数据处理和训练策略，而不仅仅是数据样式的改变。
+
+
+
+### 3. 信息提取测试
+
+本次测试对比了**updated_data**和**mixed_data**，选择的base model为internlm-7b。每个数据集均训练了100个epoch。loss和grad_norm的对比图可参考图八和图九。（其中**updated_data**后缀为real）本次饰演所采用的验证数据集改为随机抽取的微调数据集中的教师评价。
+
+<img src="C:\Users\creegon\Desktop\llm\charts\real\loss_real.jpg" width="800" height="500" alt="ddd">
+
+<center>图八</center>
+
+<img src="C:\Users\creegon\Desktop\llm\charts\real\norm_real.jpg" width="800" height="500" alt="ddd">
+
+<center>图九</center>
+
+结合两张图表，**updated_data**的学习曲线更为平缓，参数更新也较为正常。
+
+但是在实际测试中，我们还是发现，即便又到了过拟合的情况（比如第70个epoch），模型回答正确率依然极低。它不仅依然有先前两次实验中，**将多个预期输出混杂的情况**，甚至**出现了非常严重的胡编乱造的情况**（数据集中完全不存在这样的评价和内容）。例如对于某体育老师，它给出的答案是：“他是南科大很厉害的老师之一，教机械设计也很不错，教学水平高，给分也特别好，特别推荐。”
+
+除此之外，我们预想中**对于信息提取的能力也完全没有得到应验**。当询问一名教师的课程如何时，大模型只是简单地把多个评价糅杂在一起，给出了一条多次重复同一含义的回答。例如对于某英语老师，它的答案是：""他是南科大很厉害的老师之一...他很厉害...他很厉害..."。而且它**也更倾向于只回答这样笼统概括性的话语，而不是一些学生对老师具体做法的概述和评价**。
+
+尽管如此，我们依然注意到，在这样的数据集下，大模型的回答**的确更加口语化和人性化了**。例如，有些表示亲昵的词语和网络用语也被应用到了大模型的输出中（即便我并没有在这个输入的对应输出中添加类似的用语）。
+
+
+
+### 4. 参数量对比测试
+
+对于前面三个测试中的后两个，我们也有考虑过是不是因为7b的模型相对太小而导致表现不佳。因此我们还进行了对7b和20b模型的比对，但是通过对图表的分析（可以参照测试一和测试二中的图表）和同一epoch下实际结果的正确率的对比，我们发现，起码在这样对较小数据集的微调上，模型参数的不同所导致的差异微乎其微。所以可以排除掉这一因素。
+
+
+
+## 幻觉
+
+当模型生成的文本不遵循原文（Faithfulness）或者不符合事实（Factualness），我们就可以认为模型出现了幻觉的问题，也就是当前我们遇到的主要问题所在。
+
+- **Faithfulness**：是否遵循input content；
+- **Factualness**：是否符合世界知识
+![image-20231202214931919](https://github.com/MikAilis/CXSJ-III-Sustech-LLM-navigation/assets/100832845/64a0d9f2-18e6-413b-93d7-58dce6a9c45e)
+
+**幻觉的差异**
+
+- **数据源（source）不一致**：
+
+- - 例如：摘要的数据源是document，data-to-text的数据源是data table，对话的数据源是对话历史，而开放域对话的数据源可以是世界知识。
+
+- **容忍幻觉的程度不一致**：
+
+- - 在摘要、data-to-text任务中，非常看重response的Faithfulness，因此这些任务对幻觉的容忍程度很低；
+  - 而像开发域对话任务中，只需要response符合事实即可，容忍程度较高
+
+**在传统任务里，幻觉大都是指的是Faithfulness：**
+
+- **Intrinsic Hallucination（信息冲突）**: LMs在生成回复时，与输入信息产生了冲突，例如摘要问题里，abstract和document的信息不一致。
+- **Extrinsic Hallucination（无中生有）:** LMs在生成回复时，输出一些并没有体现在输入中的额外信息，比如邮箱地址、电话号码、住址，并且难以验证其真假。（PS: 按照此定义，Extrinsic Hallucination有可能是真的信息，只是需要外部信息源进行认证）
+
+**而面向LLMs，我们通常考虑的幻觉则是Factualness：**
+
+- 因为我们应用LLM的形式是open-domain Chat，而不是局限于特定任务，所以数据源可以看做任意的世界知识。LLMs如果生成了不在input source里的额外信息，但是符合事实的，这种情况也可能是对我们有帮助的。
+
+## 幻觉的原因
+
+### 数据层面
+
+在数据工程层面可能出现一些问题，导致幻觉问题：
+
+- 训练数据收集过程中，众包/爬虫检索的数据可能包含虚假信息，从而让模型记忆了错误的知识；
+- 过多的重复信息也可能导致模型的知识记忆出现bias，从而导致幻觉[1]
+
+**潜在的研究方向：**
+
+- Building High-quality Training Corpus is essential.
+- Data verification/ Data filter/ Data selection.
+
+### 模型层面
+
+即使有了高质量训练数据，LLMs仍然可能表现出幻觉现象。
+
+- **模型结构**：如果是较弱的backbone（比如RNN）可能导致比较严重的幻觉问题，但在LLMs时代应该不太可能存在这一问题；
+- **解码算法**：研究表明，如果使用不确定性较高的采样算法（e.g.，top-p）会诱导LMs出现更严重的幻觉问题。甚至可以故意在解码算法中加入一些随机性，进一步让LMs胡编乱造（可以用该方法生成一些negative samples）[2]
+
+- **暴露偏差**：训练和测试阶段不匹配的exposure bias问题可能导致LLMs出现幻觉，特别是生成long-form response的时候。[3]
+
+- **参数知识：**LMs在预训练阶段记忆的错误的知识，将会严重导致幻觉问题。[4]
+
+## 幻觉的评估
+
+现有的传统幻觉评估指标和人类结果的相关性往往较低，同时大都是task-specific的。[5]
+
+### Reference-based
+
+Reference-based的指标有两类：
+
+- **基于Source Information和Target Reference**：利用一些统计学指标，比如ROUGE、BLEU来评估输出结果和Source/Target信息的重叠度。
+- **基于Source Information**：由于NLG任务里，Target输出往往是多种多样的，因此许多工作只基于Source信息进行幻觉的评估。比如Knowledge F1。
+
+*基于Reference的评价指标，基本上只能评价Faithfulness，而无法评价Factualness，因此通常不适用于LLMs。*
+
+### **Reference-Free**
+
+**基于IE**：将知识限定于可以用三元组形式表示的关系和事件，基于额外的IE模型进行抽取，接着使用额外模型进行验证
+
+- **缺点：**
+  - 可能存在IE模型的错误传播问题。
+  - 知识被限定在三元组形式。
+
+**基于QA**：第一步先基于LM生成的回复，使用一个QG(question generation)模型生成一系列QA pairs；第二步给定Source Information，让QA模型对上一步生成的Question进行回复；第三步则是通过对比第一步的answers和第二步的answers，计算匹配指标，衡量模型的幻觉问题；
+
+- **缺点**：
+  - 同样存在QA/QG模型的错误传播问题。
+  - 难以评估Factualness，因为上述第二步里面，Source Information不可能包含全部的世界知识，因此对于一些问题难以生成可靠的回复。[6]
+
+**基于NLI**：基于NLI的方法通过NLI模型评估是否Source Information可以蕴含Generated Text，从而评估是否出现了幻觉现象。
+
+- **缺点**：
+  - Off-the-shelf NLI模型用于核查事实效果不是很好；[7]
+  - 无法评估需要世界知识的幻觉问题：仅能依赖于Source进行核查；
+  - 都是sentence-level的，无法支撑更细粒度的幻觉检查；[8]
+  - 幻觉问题和蕴含问题实际并不等价：
+    - 例子：Putin is president. -> Putin is U.S. president (可以蕴含，但是是幻觉)
+
+**基于Factualness Classification Metric**：标注/构造一批和幻觉/事实有关的数据，训练检测模型，利用该模型评估新生成文本的幻觉/事实问题。[9]
+
+**人工评估：**目前为止最靠谱的，此外还可以依靠LLM打分（比如利用GPT4，但是GPT4也存在着严重的幻觉问题，即使经过retrival-augment，检索回来的信息也有可能是错误的）
+
+## 当前幻觉问题分析
+
+### Retrieval-level causes
+
+```
+double enter to end input >>> 罗林斯特老师的体育II咋样？
+罗老师上课挺有意思的，让我们拿着跳绳动起来，活跃气氛，不过感觉老师对于体育知识可能并不是很专业，问问题老师有时候回答不上来，但是给分应该挺好，上了课的大多数人都选了老师这个方向。 罗老师很专业，曾经拿过国家奖学金，给分也是相当好，好像因为是外聘老师，所以可能没什么存在感，但是实力是有的。 罗老师很厉害，曾经拿过国家奖学金，给分也特别好，而且性格温和，上课也非常有意思，后来还选过他的攀岩课，也很有意思。 罗老师很厉害，曾经拿过国家奖学金，给分也特别好，而且性格温和，上课也非常有意思，后来还选过他的攀岩课，也很有意思。 罗老师很厉害，曾经拿过国家奖学金，给分也特别好，而且性格温和，上课也非常有意思，后来还选过他的攀岩课，也很有意思。
+```
+
+现阶段遇到的问题主要出现在信息检索上，当前模型的回答多是factual但是存在幻觉内容。如上述回答，罗林斯特老师虽然是外聘教授，但并未开设攀岩项目，整体上LLM的回答内容是符合现实逻辑的但是在客观信息上存在误差。这一结果体现了微调工作的部分成功，即通过使用南科大数据集的微调，使得模型学习了在学校相关问题上的术语、表达方式和相关内容的处理方法，但微调结果并不一定显著体现在模型的准确性与深度上。
+
+## 幻觉的缓解
+
+### 基于数据的工作
+
+**构建高质量数据集**
+
+1. **人工标注**
+
+2. 1. **训练数据**：LLM上不可行，只适用于task-specific的幻觉问题
+   2. **评测数据**：构建细粒度的幻觉评估benchmark用于分析幻觉的严重程度和原因[11]
+
+**自动筛选**：
+
+2. 1. 利用**模型筛选**出可能导致幻觉的数据并剔除；
+   2. 预训练时给更faithful的**数据加权**（wiki vs. fake news），或者不使用可靠来源的数据（比如只选用经过人工审查的数据源，如wiki或者教科书，预训练）
+
+### 模型层面的工作
+
+**模型结构**
+
+- 模型结构层面的工作往往focus在设计更能充分编码利用source information的方法，比如融入一些人类偏置，如GNN网络。
+- 或者在解码时减少模型的**生成随机性**，因为diversity和Faithfulness往往是一个trade-off的关系，减少diversity/randomness可以变相提升Faithfulness/Factuality。[10]
+
+- **检索增强**被证明可以显著减少幻觉问题，e.g., llama-index。[12]
+
+**训练方式**
+
+- **可控文本生成**：将幻觉的程度作为一个可控的属性，利用可控文本生成技术进行控制。[13,14]
+
+- **提前规划骨架，再生成**：sketch to content[15]
+
+- **强化学习：**假设是基于word的MLE训练目标，只优化唯一的reference，可能导致暴露偏差问题。现有工作将减轻幻觉的指标作为强化学习的reward函数，从而减轻幻觉现象。[16]
+
+- **多任务学习**: 通过设计合适的额外任务，可以达到减轻幻觉的效果。
+- **后处理**：设计一个小模型专门用于fix幻觉错误。[17]
+
+## 分析
+
+实际测试结果起初令我们十分困惑，因为这和我们预想中的效果大相径庭。但是在翻阅相关文献$^6$后，我们得到了一些启示。其中的第34-35页揭示了微调的主要作用：
+
+* **任务泛化：** 指导调整使LLMs能够理解并遵循自然语言指令来完成各种任务，包括未见任务。这种方法已被证明在已见和未见任务上都能够提供出色的性能，同时还可以缓解LLMs的一些弱点，如生成重复内容或未完成任务。指导调整还可以使LLMs在不同语言之间泛化到相关任务，甚至在多语言任务上使用英文指令也可以产生令人满意的结果。
+* **领域专业化：** 指导调整是将通用LLMs调整为特定领域专家的有效方法。研究表明，通过在特定领域的数据上进行微调，LLMs可以成为医学、法律、金融等领域的专业工具，实现与专业人士相媲美的性能。这种方法还可以应用于电子商务推荐系统等应用中，以支持特定领域的任务。
+
+并且结合表现各个测试中的表现特征后，我们得出了一个结论：
+
+**大模型的微调，重点不是在于提升具体某些回答的准确性，而是让大模型能够以更加专业的角度，更加相关的分析，和更符合相关设定的口吻来回答某些问题**
+
+具体表现在测试中，则是：
+
+1. 它学习了南科大邮箱的命名规则。
+2. 它学习了如何更加客观广泛地评价一个教师，并且知道了可以从哪些角度来评价。
+3. 它学习了如何以更符合学生口吻的方式来评价老师的课程。
+
+经过以上分析，我们认为，如果要达成我们南科大ai向导的目标，光靠微调是不够的，因为我们需要更高的准确性。但是抛弃微调也是不明智的，因为我们需要让大模型知道南科大ai向导应该如何友善地、亲切地、口语化地与同学们交流沟通。
+
+最终，我们将提高准确性的解决出路，定为**langchain + 知识图谱**。
+
+
+
+## langchain + 知识图谱 + llm
+
+在先前的汇报中，我们提到**知识图谱**虽然是一种高准确率的信息检索手段（例如被广泛应用于浏览器搜索中），但是它的可拓展性差，对输入数据格式要求高，并且返回内容单一乏味。但是如果能结合大模型的话，这些问题都能得到有效的解决，而**langchain**，这一**旨在帮助开发人员使用语言模型构建端到端的应用程序的强大且便利的框架**，更能为我们提供一个良好的对接平台。
+
+
+
+### 可行性分析
+
+今年（2023年）一篇文章$^7$便指出了用知识图谱增强 LLM具体的方式：
+
+1. 使用知识图谱增强 LLM 预训练，其目的是在预训练阶段将知识注入到 LLM 中
+2. 使用知识图谱增强 LLM 推理，这能让 LLM 在生成句子时考虑到最新知识
+3. 使用知识图谱增强 LLM 可解释性，从而让我们更好地理解 LLM 的行为
+
+虽然这些方法能够有效地将知识与LLM中的文本表示进行融合。但是，真实世界的知识会变化，这些方法的**局限是它们不允许更新已整合的知识**，因此在推理时，它们可能无法很好地泛化用于未见过的知识。一种解决方案是对模型重新微调，但这样相对会耗费大量时间和算力资源。而知识图谱可以**保持知识空间和文本空间的分离，并在推理时注入知识**。
+
+一个良好的框架如图十所示。大致运行机制如下：
+
+* 首先，LLM编码器接收格式化的问题和选项，并将其转换成深层次的语言模型表示。
+* 同时，KG编码器利用知识图谱中的结构化信息来提供背景知识。
+* 这两种信息通过联合推理层进行整合，这一层使用注意力机制在语言模型表示和知识图谱之间建立联系。
+* 为了提高效率和准确性，动态剪枝机制在推理过程中评估并筛选出最有可能的答案选项。
+* 最终，答案推断部分基于联合推理结果生成最终答案，充分利用了语言模型的理解能力和知识图谱的丰富信息。
+
+总体而言，它利用语言模型的强大文本理解能力，并且通过知识图谱获得结构化知识的支持，以更准确地回答复杂的问题。
+
+
+
+![图片](https://img-blog.csdnimg.cn/img_convert/299123f0e1e5e731dcb59f4e8025fcf3.png)
+
+<center>图十</center>
+
+另外，作为参考对象，**chatGPT**也有类似的功能，表现为将额外的信息作为knowledge挂载在指定的GPTs上面。在回答时，gpt便能将这些被预处理为块向量的knowledge作为prompt，添加到自己的信息检索中，从而能更有效地回答。一个示例如图十一所示（我事先将**updated_data**挂载到GPTs上面）：
+![image-20231204140804110](C:\Users\creegon\AppData\Roaming\Typora\typora-user-images\image-20231204140804110.png)
+
+<center>图十一</center>
+
+可以看到效果非常良好，这更加证明了这套方案的可行性。
+
+
+
+### 架构构建
+
+对于方案设计，我们决定参考如图十二所示的架构$^8$：
+
+<img src="https://developer.qcloudimg.com/http-save/yehe-170434/eb373fd09424cf020f33f80b12234ec9.png" width="600" height="800" alt="ddd">
+
+<center>图十二</center>
+
+
+
+#### LLM
+
+大模型层的主要功能可以分为如下几点：
+
+* **对用户问题的预处理。纠正语法错误，提取关键点，通过交互方式引导用户补充问题足够多的信息**。比如，如果一名同学询问“请告诉我张进老师的信息”，在实际检索知识库后，大模型会发现南科大有两个张进老师，它就会返回“请问您想知道数学系的张进老师，还是计算机系的张进老师？”。等到用户补充完整信息后，大模型会将两次对话得到的信息提取拼接起来，从而向本地知识库提出“计算机系的张进老师”的检索诉求。
+* **对检索结果的再处理**。比如，如果一名同学询问“请告诉我计算机系的张进老师的信息”，而知识库返回了长达两三百字的张进老师的成就信息，这无疑会对同学造成极大的困扰。超出某个阈值后，大模型就会对这样的信息进行再处理，提取浓缩为便于阅读的较短的信息返回给用户。
+
+
+
+#### 查询系统
+
+计划采用**Embedding-based search**$^9$的方式，将文字形式的查询请求，编码为数值向量的形式，体现潜在的关系。即，将用户的请求进行 Embedding，获得向量。然后使用问题向量在知识库中搜索，找到与之最匹配的若干记录。将这些记录的原始材料返回。
+
+## 与单纯LLM对比
+
+知识图谱主要的问题在于结构化，涉及到: 关系结构化、内容输入结构化、查询结构化。
+
+当知识图谱存储内容很多的时候，根据用户上下文和最近的问题，来查询知识图谱内容，一定会涉及到构建一次查询语句。
+
+而大模型的核心就是非结构化。训练过程和推理的时候，都不需要做结构化，而且实时开始回复。
+
+| 对比项           | 知识图谱 + 大模型                                            | 纯大模型                               |
+| ---------------- | ------------------------------------------------------------ | -------------------------------------- |
+| 训练工作         | 构建知识图谱关系结构化、内容结构化                           | 语料筛选和大模型训练                   |
+| 使用时流程       | 大模型推理生成知识图谱查询语句，知识图谱内容查询；将查询出来的内容放到prompt中，再进行一次大模型推理 | 大模型推理一次                         |
+| 用户感知反馈延迟 | 平均10秒左右                                                 | 立即反馈                               |
+| 后期升级维护     | 构建新的图谱关系、结构化内容，需要大量人工，无法全自动化     | 增加语料，再次训练，无需人工，全自动化 |
+
+知识图谱+LLM的主要优势在
+
+1. 知识细粒度的可操作性
+2. 实时可更新性
+3. 知识来源的可追溯性
+4. 相比纯LLM幻觉会更少·
+
+### 知识细粒度的可操作性
+
+可操作性是指可以很方便地添加或删除、更新知识，这些内容在单纯LLM中难以显示做到。
+
+知识细粒度是知识图谱的上述操作可以精确到每一条知识，甚至到知识的entry/relation,这是大模型做不到的。
+
+### 实时可更新性
+
+这个优势来自于上述的细粒度可操作性。大模型的更新要求足够数量的新数据如果数量太少的话则几乎无法改变模型学习到的distribution; 而知识图谱则可以在数据流上实时进行知识的更新，哪怕只有一条新数据也可以更新。
+
+### 知识来源的可追溯性
+
+知识图谱回答问题用到的每条知识都可以记录其来源(比如文献、链接等)，并在回答问题时一并提供，便于用户对答案进行正确性确认。而大模型做不到这一点
+
+因此，知识图谱的特点是: 
+
+- 结构化知识，支持基于字面的匹配，比较rigid、泛化推广能力不强
+- 快速更新数据，可用于实时的知识过滤器，比如快速查找最新的新闻热点和关键词
+- 知识可追溯
+
+而大模型的特点是: 
+
+- 学习知识的数据分布，支持基于语义 (semantics) 的匹配，关键词匹配能力稍弱，但泛用性强，可以针对unseen question进行回答。 
+- 知识不可追溯，可能存在幻觉 (hallucination) 问题
+
+## 后续改进
+
+1. **数据收集与处理优化**：
+   - 持续收集南方科技大学相关的语料库，包括但不限于教师介绍、课程评价、学术论文等，以丰富训练数据。
+   - 研究并应用高效的数据处理技术，以准确提取和清洗数据，增强数据集的质量。
+   - 设计并实施更为细致的数据注释方案，确保数据集的多样性和平衡性，避免偏见和过拟合。
+2. **模型微调与验证**：
+   - 细化微调策略，使用更多细分的超参数搜索和交叉验证方法来优化模型的表现。
+   - 实施严格的模型验证过程，通过设定控制组和实验组对比模型在不同数据集上的表现，评估模型对新数据的适应能力和泛化性。
+   - 分析错误答案和模型表现不佳的情况，找出模型的不足之处，并针对性地进行改进。
+3. **技术框架整合与调整**：
+   - 结合langchain技术和知识图谱，构建一个更加智能和互动的问答系统，让系统能够更加深入地理解和回答复杂的问题。
+   - 优化知识图谱的结构和内容，确保它包含丰富且高质量的知识点，以提高答案的准确性和相关性。
+   - 实验不同的知识图谱集成方法，例如使用图神经网络（GNN）来增强模型对知识图谱结构的理解。
+
+
+
+
+
+
+
+
+
+## 参考文献
+
+[1]*Katherine Lee, Daphne Ippolito, Andrew Nystrom, Chiyuan Zhang, Douglas Eck, Chris Callison-Burch, and Nicholas Carlini. 2021. Deduplicating training data makes language models better. arXiv preprint arXiv:2107.06499 (2021).*
+
+[2]*Nayeon Lee, Wei Ping, Peng Xu, Mostofa Patwary, Mohammad Shoeybi, and Bryan Catanzaro. 2022. Factuality enhanced language models for open-ended text generation. arXiv preprint arXiv:2206.04624 (2022).*
+
+[3]*Chaojun Wang and Rico Sennrich. 2020. On exposure bias, hallucination and domain shift in neural machine translation. In Proceedings of the 2020 Annual Conference of the Association for Computational Linguistics. 3544–3552.*
+
+[4]*Shayne Longpre, Kartik Perisetla, Anthony Chen, Nikhil Ramesh, Chris DuBois, and Sameer Singh. 2021. Entity-based knowledge conflicts in question answering. In Proceedings of the 2021 Conference on Empirical Methods in Natural Language Processing (EMNLP’21). 7052–7063.*
+
+[5]*Artidoro Pagnoni, Vidhisha Balachandran, and Yulia Tsvetkov. 2021. Understanding factuality in abstractive summarization with FRANK: A benchmark for factuality metrics. In Proceedings of the 2021 Conference of the North American Chapter of the Association for Computational Linguistics: Human Language Technologies (NAACL-HLT’21). 4812–4829*
+
+[6]*Esin Durmus, He He, and Mona Diab. 2020. FEQA: A question answering evaluation framework for faithfulness assessment in abstractive summarization. In Proceedings of the 58th Annual Meeting of the ACL. 5055–5070.*
+
+[7]*Nouha Dziri, Hannah Rashkin, Tal Linzen, and David Reitter. 2021. Evaluating groundedness in dialogue systems: The BEGIN benchmark. In Findings of the Association for Computational Linguistics. Association for Computational Linguistics, 1–12.*
+
+[8]*Tanya Goyal and Greg Durrett. 2020. Evaluating factuality in generation with dependency-level entailment. In Proceedings of the 2020 Conference on Empirical Methods in Natural Language Processing: Findings. 3592–3603.*
+
+[9]*Emily Dinan, Stephen Roller, Kurt Shuster, Angela Fan, Michael Auli, and Jason Weston. 2018. Wizard of Wikipedia: Knowledge-powered conversational agents. In Proceedings of the International Conference on Learning Representations.*
+
+[10]*Nayeon Lee, Wei Ping, Peng Xu, Mostofa Patwary, Mohammad Shoeybi, and Bryan Catanzaro. 2022. Factuality enhanced language models for open-ended text generation. arXiv preprint arXiv:2206.04624 (2022).*
+
+[11]*Saadia Gabriel, Asli Celikyilmaz, Rahul Jha, Yejin Choi, and Jianfeng Gao. 2021. GO FIGURE: A meta evaluation of factuality in summarization. In Findings of the Association for Computational Linguistics: ACL-IJCNLP 2021. Association for Computational Linguistics, 478–487.*
+*Or Honovich, Leshem Choshen, Roee Aharoni, Ella Neeman, Idan Szpektor, and Omri Abend. 2021. Q2: Evaluating factual consistency in knowledge-grounded dialogues via question generation and question answering. In Proceedings of the 2021 Conference on Empirical Methods in Natural Language Processing. 7856–7870*
+
+[12]*Peng, Baolin, Michel Galley, Pengcheng He, Hao Cheng, Yujia Xie, Yu Hu, Qiuyuan Huang et al. "Check your facts and try again: Improving large language models with external knowledge and automated feedback."arXiv preprint arXiv:2302.12813(2023).*
+
+[13]*Hannah Rashkin, David Reitter, Gaurav Singh Tomar, and Dipanjan Das. 2021. Increasing faithfulness in knowledgegrounded dialogue with controllable features. In Proceedings of the 59th Annual Meeting of the Association for Computational Linguistics and the 11th International Joint Conference on Natural Language Processing. 704–718.*
+
+[14]Zeqiu Wu, Michel Galley, Chris Brockett, Yizhe Zhang, Xiang Gao, Chris Quirk, Rik Koncel-Kedziorski, et al. 2021. A controllable model of grounded response generation. In Proceedings of the AAAI Conference on Artificial Intelligence. 14085–14093.
+
+[15]*Ratish Puduppully, Li Dong, and Mirella Lapata. 2019. Data-to-text generation with content selection and planning. In Proceedings of the AAAI Conference on Artificial Intelligence*
+
+[16]*Yangming Li, Kaisheng Yao, Libo Qin, Wanxiang Che, Xiaolong Li, and Ting Liu. 2020. Slot-consistent NLG for task-oriented dialogue systems with iterative rectification network. In Proceedings of the 58th Annual Meeting of the Association for Computational Linguistics. 97–106.*
+*Mohsen Mesgar, Edwin Simpson, and Iryna Gurevych. 2021. Improving factual consistency between a response and persona facts. In Proceedings of the 16th Conference of the European Chapter of the Association for Computational Linguistics. 549–562.*
+
+[17]*Sihao Chen, Fan Zhang, Kazoo Sone, and Dan Roth. 2021. Improving faithfulness in abstractive summarization with contrast candidate generation and selection. In Proceedings of the 2021 Conference of the North American Chapter of the Association for Computational Linguistics: Human Language Technologies (NAACL-HLT’21). 5935–5941.*
+
+[18]《Full Parameter Fine-tuning for Large Language Models with Limited Resources》，2023
+
+[19]《Parameter-Efficient Transfer Learning for NLP》,  2019
+
+[20]《GPT Understands, Too》,  2021
+
+[21]《P-Tuning v2: Prompt Tuning Can Be Comparable to Fine-tuning Universally Across Scales and Tasks》,  2022
+
+[22]《LORA: LOW-RANK ADAPTATION OF LARGE LANGUAGE MODELS》,  2021
+
+[23]《QLORA: Efficient Finetuning of Quantized LLMs》,  2023
+
+[24]《A Survey of Large Language Models》，2023
+
+[25]《Unifying Large Language Models and Knowledge Graphs: A Roadmap》,  2023
+
+[26] 如何用大语言模型构建一个知识问答系统-腾讯云开发者社区-腾讯云 (tencent.com)
+
+[27]《Search: Query Matching via Lexical, Graph, and Embedding Methods》,  2023
